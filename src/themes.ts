@@ -57,7 +57,7 @@ export interface MindmapThemeInfo {
   readonly lines: readonly string[];
 }
 
-export const DEFAULT_MINDMAP_THEME = 'fresh';
+export const DEFAULT_MINDMAP_THEME = 'rainbow';
 
 const DEFAULT_BRANCH_COLORS: readonly MindmapBranchColor[] = [
   { line: '$red', fill: '$pink' },
@@ -69,19 +69,19 @@ const DEFAULT_BRANCH_COLORS: readonly MindmapBranchColor[] = [
 
 export const BUILT_IN_MINDMAP_THEMES: readonly MindmapThemeDefinition[] = [
   {
-    id: 'fresh',
-    label: '清新',
-    root: { fill: '$blue', stroke: '$sky', text: '$ink' },
-    level1: { fill: '$yellow', fillOpacity: 0.5, stroke: '$amber', text: '$ink' },
-    deeper: {},
-    line: 'branch'
-  },
-  {
     id: 'rainbow',
     label: '彩虹',
     root: { fill: '$purple', stroke: '$violet', text: '$ink' },
     level1: 'branch',
     deeper: 'branch',
+    line: 'branch'
+  },
+  {
+    id: 'fresh',
+    label: '清新',
+    root: { fill: '$blue', stroke: '$sky', text: '$ink' },
+    level1: { fill: '$yellow', fillOpacity: 0.5, stroke: '$amber', text: '$ink' },
+    deeper: {},
     line: 'branch'
   },
   {
