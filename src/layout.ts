@@ -108,6 +108,9 @@ export function createMindmapLayout(
   const growthCache = new WeakMap<LayoutTree, ReadonlyMap<string, Growth>>();
   return {
     id: MINDMAP_LAYOUT_ID,
+    selectableSubtree: true,
+    footprint: 'subtree',
+    supportsContentScale: false,
     label: '思维导图',
     parseOptions: parseMindmapOptions,
     arrange(tree) {
