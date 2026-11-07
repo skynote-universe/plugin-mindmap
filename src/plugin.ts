@@ -56,6 +56,7 @@ import {
   type MindmapOptions,
   type TopicSide
 } from './layout';
+import { MindmapFoldControls, type MindmapControlTooltip } from './fold-controls';
 import { parseOutline, parseTopicList, type OutlineTopic } from './outline';
 import { isSamePlace, resolveTopicDrop, topicDropFields, type DropCandidate, type TopicDrop } from './drop';
 import { previewStructure, type MindmapStructurePreview } from './structure-preview';
@@ -152,6 +153,9 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
    * 粘贴到主题下时补回，与拖动改挂一致 (分支线样式会被子树继承，线上文字一并带着)
    */
   private readonly copiedBranches = new Map<string, unknown>();
+  private readonly descendantCounts = new Map<string, number>();
+  private readonly foldDirections = new Map<string, ReadonlyMap<string, Growth>>();
+  private foldControls: MindmapFoldControls | null = null;
 
   /** @throws 传入的主题或结构定义不合法 */
   constructor(options?: MindmapPluginOptions) {
@@ -174,6 +178,28 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
     };
     ctx.registerInputScope({ id: 'mindmap:keys', priority: KEY_PRIORITY, onKeyDown: (e) => this.onKeyDown(e) });
     ctx.registerPointerHooks(this, DRAG_PRIORITY);
+    ctx.onDocumentChange((change) => {
+      const nodes = change.nodes;
+      if (
+        change.contentReplaced ||
+        nodes.added.size ||
+        nodes.removed.size ||
+        nodes.reparented.size ||
+        [...nodes.data].some((id) => {
+          const paths = nodes.dataPaths?.get(id);
+          return !paths || paths.some((path) => path[0] === 'layout' || path[0] === 'layoutItem');
+        })
+      )
+        this.descendantCounts.clear();
+    });
+    ctx.onDocumentChange(() => this.foldDirections.clear());
+    ctx.layouts.onChange(() => this.foldDirections.clear());
+    this.foldControls = new MindmapFoldControls(ctx, {
+      rootOf: (id) => this.mindmapRootOf(id),
+      stateOf: (id) => this.getFoldState(id),
+      directionOf: (id, rootId) => this.foldDirection(id, rootId),
+      setCollapsed: (id, collapsed) => this.setCollapsed(id, collapsed)
+    });
     // 复制与剪切只记下主题外观与分支线设置 (返回 null)，剪贴板内容仍由基础剪贴板生成
     ctx.registerClipboardHandler(
       {
@@ -186,9 +212,14 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
   }
 
   unmount(): void {
+    this.foldControls?.unmount();
+    this.foldControls = null;
+    this.foldDirections.clear();
+    if (this.drag) this.finish(this.drag.pointerId);
     this.drag = null;
     this.copiedLooks.clear();
     this.copiedBranches.clear();
+    this.descendantCounts.clear();
     this.releaseRegistries?.();
     this.releaseRegistries = null;
   }
@@ -201,20 +232,124 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
     sortSiblingsByLayer([...this.ctx.entities.getChildIds(parentId)].map((id) => this.getNode(id)!));
 
   /** 节点所在的导图 (自身是导图的根或成员)；不在导图中时为 undefined */
-  private mindmapOf(nodeId: string): { tree: LayoutTree; member: LayoutMember } | undefined {
+  private mindmapOf(nodeId: string, visibleOnly = false): { tree: LayoutTree; member: LayoutMember } | undefined {
     const rootId = findLayoutRootId(nodeId, this.getNode);
     const root = rootId === undefined ? undefined : this.getNode(rootId);
     if (!root || root.layout?.type !== MINDMAP_LAYOUT_ID) return undefined;
-    const tree = buildLayoutTree(root, this.childrenOf, this.layout);
+    const tree = buildLayoutTree(root, this.childrenOf, this.layout, undefined, { visibleOnly });
     const member = tree.get(nodeId);
     return member && { tree, member };
   }
 
   // ================= 公开命令 (宿主界面调用) =================
 
+  /** 宿主只负责统一Tooltip，控件绘制和命中由本插件处理。 */
+  onControlTooltipChange(listener: (value: MindmapControlTooltip | null) => void): () => void {
+    if (this.foldControls) return this.foldControls.onTooltipChange(listener);
+    listener(null);
+    return () => {};
+  }
+
+  private foldDirection(id: string, rootId: string): Growth {
+    const structure = this.structures.get(this.getOptions(rootId).structure);
+    // 中心主题沿结构首选出边定位；双向结构固定首选侧，折叠后仍保持同一位置。
+    if (id === rootId) return structure.rootGrowths[0] ?? 'right';
+    let directions = this.foldDirections.get(rootId);
+    if (!directions) {
+      const root = this.getNode(rootId)!;
+      const tree = buildLayoutTree(root, this.childrenOf, this.layout, undefined, { visibleOnly: true });
+      directions = structure.growth(tree);
+      this.foldDirections.set(rootId, directions);
+    }
+    return directions.get(id) ?? 'right';
+  }
+
+  /** 折叠只影响下级主题的展示，不删除内容；批量展开也只产生一条历史记录。 */
+  getFoldState(nodeId: string): { collapsed: boolean; descendants: number } | undefined {
+    const rootId = findLayoutRootId(nodeId, this.getNode);
+    const node = this.getNode(nodeId);
+    if (!node || rootId === undefined || this.getNode(rootId)?.layout?.type !== MINDMAP_LAYOUT_ID) return undefined;
+    const cached = this.ctx.document.readScope === null ? this.descendantCounts.get(nodeId) : undefined;
+    if (cached !== undefined) return { collapsed: !!node.layoutState?.collapsed, descendants: cached };
+    let descendants = 0;
+    const children = (parent: Readonly<NodeEntity>): readonly Readonly<NodeEntity>[] =>
+      parent.id !== nodeId && parent.layout ? [] : this.childrenOf(parent.id).filter((child) => !!child.layoutItem);
+    const pending = [...children(node)];
+    for (let i = 0; i < pending.length; i++) {
+      descendants++;
+      pending.push(...children(pending[i]));
+    }
+    if (this.ctx.document.readScope === null) this.descendantCounts.set(nodeId, descendants);
+    return { collapsed: !!node.layoutState?.collapsed, descendants };
+  }
+
+  setCollapsed(nodeId: string, collapsed: boolean): void {
+    const node = this.getNode(nodeId);
+    const rootId = this.mindmapRootOf(nodeId);
+    const root = rootId === undefined ? undefined : this.getNode(rootId);
+    if (
+      !node ||
+      !root ||
+      !this.canChangeFold(node, root) ||
+      !this.childrenOf(nodeId).some((child) => !!child.layoutItem)
+    )
+      return;
+    if (!!node.layoutState?.collapsed === collapsed) return;
+    this.ctx.document.updateNode(
+      nodeId,
+      { layoutState: { ...node.layoutState, collapsed } },
+      { label: collapsed ? '折叠分支' : '展开分支' }
+    );
+  }
+
+  expandAll(rootId: string): void {
+    this.expandToDepth(rootId, Infinity);
+  }
+
+  /** 中心主题为第一级；显示至该级，其下有子主题的节点折叠。 */
+  expandToDepth(rootId: string, levels: number): void {
+    if (!(levels === Infinity || (Number.isInteger(levels) && levels >= 1))) return;
+    const found = this.mindmapOf(rootId);
+    if (!found || found.member !== found.tree.root || !this.canChangeFold(found.member.node, found.tree.root.node))
+      return;
+    this.ctx.document.batch(
+      () => {
+        const pending = [found.tree.root];
+        for (let i = 0; i < pending.length; i++) {
+          const member = pending[i];
+          pending.push(...member.children);
+          if (!member.children.length || !this.canChangeFold(member.node, found.tree.root.node)) continue;
+          const collapsed = member.depth >= levels - 1;
+          if (!!member.node.layoutState?.collapsed !== collapsed)
+            this.ctx.document.updateNode(member.node.id, { layoutState: { ...member.node.layoutState, collapsed } });
+        }
+      },
+      levels === Infinity ? '展开全部主题' : '按层级展开导图'
+    );
+  }
+
+  /** 搜索定位时展开目标的祖先，保留目标本身的折叠状态。只读/锁定分支不写入。 */
+  revealTopic(nodeId: string): void {
+    const pending: string[] = [];
+    for (let node = this.getNode(nodeId); node?.parentId !== undefined;) {
+      const parent = this.getNode(node.parentId);
+      if (!parent) break;
+      if (node.layoutItem && parent.layoutState?.collapsed) pending.push(parent.id);
+      node = parent;
+    }
+    this.ctx.document.batch(() => {
+      for (const id of pending) this.setCollapsed(id, false);
+    }, '展开定位路径');
+  }
+
+  private canChangeFold(node: Readonly<NodeEntity>, root: Readonly<NodeEntity>): boolean {
+    return !this.ctx.session.isReadOnly && !this.ctx.session.inMaintenance && !root.locked && !node.locked;
+  }
+
   /** 节点所在导图的中心主题 id；不在导图中时为 undefined */
   mindmapRootOf(nodeId: string): string | undefined {
-    return this.mindmapOf(nodeId)?.tree.root.node.id;
+    const id = findLayoutRootId(nodeId, this.getNode);
+    return id !== undefined && this.getNode(id)?.layout?.type === MINDMAP_LAYOUT_ID ? id : undefined;
   }
 
   /** 导图参数 (已补齐默认值；线型未单独设置时为结构的默认线型) */
@@ -354,7 +489,7 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
     const { session } = this.ctx;
     if (session.selectedNodeIds.size !== 1 || session.selectedConnectorIds.size > 0) return false;
     const nodeId = [...session.selectedNodeIds][0];
-    const found = this.mindmapOf(nodeId);
+    const found = this.mindmapOf(nodeId, true);
     if (!found) return false;
     // 删除中心主题 (整张导图) 或锁定的主题交给通用的删除处理
     if (remove && (found.member === found.tree.root || found.member.node.locked)) return false;
@@ -450,6 +585,8 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
     const side = parent === tree.root ? this.structures.of(tree).newChildSide?.(tree) : undefined;
     const { document } = this.ctx;
     return document.batch(() => {
+      if (parent.node.layoutState?.collapsed)
+        document.updateNode(parent.node.id, { layoutState: { ...parent.node.layoutState, collapsed: false } });
       const id = this.createTopic({ text: '分支主题', parentId: parent.node.id, x: 0, y: 0, side });
       if (id) this.applyThemeToSubtree(id);
       return id;
@@ -617,6 +754,9 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
       // 先记下旧位置的主题外观：移动后只替换主题写的项，用户改过的保留
       const previous = this.subtreeLooks(id);
       document.batch(() => {
+        const parent = fields.parentId === undefined ? undefined : this.getNode(fields.parentId);
+        if (parent?.layoutState?.collapsed)
+          document.updateNode(parent.id, { layoutState: { ...parent.layoutState, collapsed: false } });
         document.updateNode(id, fields);
         // 层级与所在分支可能变了：按新位置套用主题外观
         this.applyThemeToSubtree(id, previous);
@@ -693,10 +833,11 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
     });
   }
 
-  /** 整张导图 (根与全部成员) 的世界外框 */
+  /** 整张导图当前可见成员的世界外框，隐藏分支不影响拖出与独立导图的落位。 */
   private treeBounds(tree: LayoutTree): RectBounds {
     const bounds: RectBounds = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
     const visit = (member: LayoutMember): void => {
+      if (!this.ctx.document.visibility.isNodeVisible(member.node.id)) return;
       const b = computeNodeWorldBounds(member.node, this.ctx.entities.getWorldTransform(member.node.id)!);
       bounds.left = Math.min(bounds.left, b.left);
       bounds.top = Math.min(bounds.top, b.top);
@@ -739,6 +880,8 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
     });
     const { document, session } = this.ctx;
     const pasted = document.batch(() => {
+      if (parent.node.layoutState?.collapsed)
+        document.updateNode(parent.node.id, { layoutState: { ...parent.node.layoutState, collapsed: false } });
       const result = document.pasteEntities({ ...payload, nodes }, { x: 0, y: 0 }, { parentId: parent.node.id });
       const previous = this.pastedLooks(payload, result.nodeIds);
       for (const id of result.nodeIds) this.applyThemeToSubtree(id, previous);
@@ -788,6 +931,8 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
     if (topics.length === 0) return false;
     const { document, session } = this.ctx;
     const ids = document.batch(() => {
+      if (parent.node.layoutState?.collapsed)
+        document.updateNode(parent.node.id, { layoutState: { ...parent.node.layoutState, collapsed: false } });
       const created = this.createOutlineChildren(parent.node.id, topics, parent.depth + 1);
       for (const id of created) this.applyThemeToSubtree(id);
       return created;

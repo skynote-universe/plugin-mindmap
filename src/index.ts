@@ -18,3 +18,5 @@ export * from './structure-preview';
 export function createPlugins(): SkyNotePlugin[] {
   return [new MindmapPlugin()];
 }
+
+export type { MindmapControlTooltip } from './fold-controls';
