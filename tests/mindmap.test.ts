@@ -92,7 +92,7 @@ describe('思维导图', () => {
     engine.session.onTextEditRequest(requests);
     expect(key(engine, 'Tab')).toBe(true);
     const childId = selected(engine);
-    expect(requests).toHaveBeenCalledWith(childId);
+    expect(requests).toHaveBeenCalledWith(childId, undefined);
     expect(engine.session.textEditing?.id).toBe(childId);
     const child = store.getNode(childId)!;
     expect(child).toMatchObject({ parentId: rootId, layoutItem: { side: 'right' } });
@@ -974,4 +974,32 @@ describe('大纲解析', () => {
     expect(parseOutline('第一行\n第二行')).toBeNull();
     expect(parseOutline('- 只有一行')).toBeNull();
   });
+});
+
+it('结构创建示例包含两级主题，所选结构及主题生效，整图一次撤销重做', () => {
+  const { engine, store } = setup();
+  const plugin = engine.plugins.get(MINDMAP_PLUGIN_ID) as MindmapPlugin;
+  try {
+    for (const structure of plugin.listStructures()) {
+      const before = Object.keys(store.getView().content.nodes).length;
+      const rootId = plugin.createMindmap({ x: 500, y: 400 }, { structure: structure.id, sample: true })!;
+      expect(plugin.getOptions(rootId).structure).toBe(structure.id);
+      const nodes = Object.values(store.getView().content.nodes);
+      const children = nodes.filter((node) => node.parentId === rootId);
+      expect(children).toHaveLength(4);
+      expect(children.every((node) => node.layoutItem && node.style?.fill)).toBe(true);
+      expect(nodes.filter((node) => children.some((child) => node.parentId === child.id))).toHaveLength(0);
+      expect(engine.session.textEditing).toBeNull();
+      expect(Object.keys(store.getView().content.nodes)).toHaveLength(before + 5);
+      expect(store.undo()).toBe(true);
+      expect(Object.keys(store.getView().content.nodes)).toHaveLength(before);
+      expect(store.redo()).toBe(true);
+      expect(store.getNode(rootId)).toBeDefined();
+      store.undo();
+    }
+    engine.session.setReadOnly(true);
+    expect(plugin.createMindmap({ x: 0, y: 0 }, { sample: true })).toBeNull();
+  } finally {
+    engine.destroy();
+  }
 });

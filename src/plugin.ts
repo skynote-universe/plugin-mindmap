@@ -269,11 +269,28 @@ export class MindmapPlugin implements SkyNotePlugin, PointerHooks {
   }
 
   /** 以 point (世界坐标) 为中心新建一张导图并选中中心主题，一步撤销；返回中心主题 id */
-  createMindmap(point: Point): string | null {
+  createMindmap(point: Point, options?: { structure?: string; sample?: boolean }): string | null {
     const { document, session } = this.ctx;
+    if (session.isReadOnly || session.inMaintenance) return null;
     const id = document.batch(() => {
       const rootId = this.createTopic({ text: '中心主题', x: point.x, y: point.y, origin: 'center', root: true });
-      if (rootId) this.applyThemeToSubtree(rootId);
+      if (rootId) {
+        const structure = this.structures.get(options?.structure ?? 'both').id;
+        if (options?.structure !== undefined)
+          document.updateNode(rootId, { layout: { type: MINDMAP_LAYOUT_ID, options: { structure } } });
+        if (options?.sample) {
+          // 与结构卡片保持相同的两级示例；直接创建避免逐个插入时请求文字编辑。
+          for (let index = 0; index < 4; index++)
+            this.createTopic({
+              text: `分支主题 ${index + 1}`,
+              parentId: rootId,
+              x: 0,
+              y: 0,
+              side: structure === 'both' ? (index < 2 ? 'right' : 'left') : undefined
+            });
+        }
+        this.applyThemeToSubtree(rootId);
+      }
       return rootId;
     }, '添加思维导图');
     if (id) session.setSelection({ nodeIds: [id], connectorIds: [] });
